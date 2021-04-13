@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,6 +24,7 @@ func main() {
 	branch := flag.String("branch", "main", "branch name")
 	timeout := flag.Int("timeout", 5, "timeout in seconds")
 	cmtsPath := flag.String("cmtspath", "", "path to commit files directory")
+	outpath := flag.String("outpath", "out.csv", "path to output file")
 	flag.Parse()
 
 	if *timeout <= 0 {
@@ -37,14 +39,21 @@ func main() {
 	if *cnumber <= 0 {
 		log.Fatal("invalid cnumber")
 	}
+	if *outpath == "" {
+		log.Fatal("output path can't be empty")
+	}
 
-	err := run(time.Duration(*timeout)*time.Second, *cmtsPath, *repurl, *branch, *cnumber)
+	err := run(time.Duration(*timeout)*time.Second, *cmtsPath, *repurl, *branch, *outpath, *cnumber)
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-func run(timeout time.Duration, cmtsPath, repurl, branch string, cnumber int) error {
+type Contribution struct {
+	Reviewed, Created int
+}
+
+func run(timeout time.Duration, cmtsPath, repurl, branch, outpath string, cnumber int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -85,6 +94,8 @@ func run(timeout time.Duration, cmtsPath, repurl, branch string, cnumber int) er
 		return err
 	}
 
+	conts := make(map[string]Contribution)
+
 	for i := 0; i < cnumber; i++ {
 		// fetch commit page
 		p, err := fetchLink(c, ctx, domContent, link)
@@ -93,7 +104,7 @@ func run(timeout time.Duration, cmtsPath, repurl, branch string, cnumber int) er
 		}
 
 		// get commit
-		cmt, err := getCurrentCommit(p)
+		cmt, err := getCommitHash(p)
 		if err != nil {
 			return err
 		}
@@ -110,11 +121,40 @@ func run(timeout time.Duration, cmtsPath, repurl, branch string, cnumber int) er
 			return err
 		}
 
+		// get author
+		author, err := getAuthor(p)
+		if err != nil {
+			return err
+		}
+		if i, v := conts[author]; !v {
+			conts[author] = Contribution{Created: 1, Reviewed: 0}
+		} else {
+			i.Created++
+		}
+
+		// get reviewers
+		reviewers, err := getReviewers(msg)
+		if err != nil {
+			return err
+		}
+		for _, rev := range reviewers {
+			if i, v := conts[rev]; !v {
+				conts[rev] = Contribution{Created: 0, Reviewed: 1}
+			} else {
+				i.Created++
+			}
+		}
+
 		// write commit message
 		err = ioutil.WriteFile(cmtsPath+cmt+".commit", []byte(msg), 0644)
 		if err != nil {
 			return err
 		}
+	}
+
+	err = ioutil.WriteFile(outpath, []byte(buildCSVString(conts)), 0644)
+	if err != nil {
+		return err
 	}
 
 	return nil
@@ -174,7 +214,7 @@ func getMainLink(r, branch string) (string, error) {
 	return "https://chromium.googlesource.com" + s, nil
 }
 
-func getCurrentCommit(r string) (string, error) {
+func getCommitHash(r string) (string, error) {
 	doc, err := html.Parse(strings.NewReader(r))
 	if err != nil {
 		return "", err
@@ -193,6 +233,33 @@ func getCurrentCommit(r string) (string, error) {
 			}
 		}
 		return "", fmt.Errorf("can't find commit!")
+	}
+	s, err := f(doc)
+	if err != nil {
+		return "", err
+	}
+	return s, nil
+}
+
+func getAuthor(r string) (string, error) {
+	doc, err := html.Parse(strings.NewReader(r))
+	if err != nil {
+		return "", err
+	}
+	var f func(*html.Node) (string, error)
+	f = func(n *html.Node) (string, error) {
+		if n.Type == html.TextNode {
+			if n.Data == "author" {
+				return n.Parent.NextSibling.FirstChild.Data, nil
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			l, err := f(c)
+			if err == nil {
+				return l, nil
+			}
+		}
+		return "", fmt.Errorf("can't find author!")
 	}
 	s, err := f(doc)
 	if err != nil {
@@ -270,4 +337,23 @@ func getParentCommitLink(r, repurl string) (string, error) {
 		return "", err
 	}
 	return repurl + "/+/" + s, nil
+}
+
+func getReviewers(msg string) ([]string, error) {
+	lines := strings.Split(msg, "\n")
+	revs := make([]string, 0)
+	for _, line := range lines {
+		if strings.Contains(line, "Reviewed-by: ") && strings.Index(line, "Reviewed-by: ") == 0 {
+			revs = append(revs, line[13:])
+		}
+	}
+	return revs, nil
+}
+
+func buildCSVString(conts map[string]Contribution) string {
+	s := "contributor,created,reviewed"
+	for k, v := range conts {
+		s += "\n" + k + "," + strconv.Itoa(v.Created) + "," + strconv.Itoa(v.Reviewed)
+	}
+	return s
 }
